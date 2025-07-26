@@ -1,0 +1,598 @@
+import pandas as pd
+import requests
+import os
+from datetime import datetime
+import glob
+import shutil
+import re
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as mticker
+import logging
+import numpy as np # Importa numpy
+
+# script_analise_vendas_clientes.py
+#
+# Descrição: Este script automatiza o processo de download, processamento,
+# armazenamento e análise de dados de vendas de clientes de uma fonte JSON remota.
+# Ele inclui funcionalidades de backup, tratamento de dados, e visualizações interativas.
+#
+# Dependências: pandas, requests, matplotlib, seaborn, numpy
+#
+# Notas:
+# - Configura o logging para rastrear o fluxo do programa e erros.
+# - Gerencia backups de arquivos CSV para evitar perda de dados.
+# - Oferece um menu interativo para explorar os dados.
+
+# --- Configuração do Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+logger = logging.getLogger(__name__)
+
+# Arquivo de log com nível INFO para persistência dos registros
+file_handler = logging.FileHandler('meu_log.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+
+# --- Funções de Processamento de Dados ---
+
+def extrair_dataframe(json_obj):
+    """
+    Normaliza um objeto JSON (lista ou dicionário) em um DataFrame pandas.
+    Esta função tenta lidar com diferentes estruturas JSON comuns:
+    1. Uma lista de dicionários.
+    2. Um dicionário que contém uma lista aninhada de dicionários (procura pela primeira lista
+       não vazia de dicionários dentro do dicionário pai).
+    3. Um dicionário simples (normaliza o próprio dicionário).
+    Após a normalização, 'explode' quaisquer colunas que ainda contenham listas
+    para garantir que cada elemento da lista tenha sua própria linha.
+
+    Args:
+        json_obj (list or dict): O objeto JSON a ser normalizado.
+
+    Returns:
+        pd.DataFrame: Um DataFrame pandas normalizado e "explodido" (se necessário).
+
+    Raises:
+        ValueError: Se o formato JSON for inesperado e não puder ser normalizado.
+    """
+    if isinstance(json_obj, list):
+        df = pd.json_normalize(json_obj)
+    elif isinstance(json_obj, dict):
+        # Tenta encontrar uma lista de dicionários aninhada no JSON,
+        # caso o JSON não seja uma lista de dicionários no nível superior.
+        for chave, valor in json_obj.items():
+            if isinstance(valor, list) and len(valor) > 0 and isinstance(valor[0], dict):
+                df = pd.json_normalize(valor)
+                break
+        else:
+            # Se não encontrou uma lista aninhada, normaliza o próprio dicionário.
+            df = pd.json_normalize(json_obj)
+    else:
+        logger.error(f"Formato JSON inesperado recebido: {type(json_obj)}")
+        raise ValueError("Formato JSON inesperado para normalização. Esperado lista ou dicionário.")
+
+    # Identifica e "explode" colunas que contêm listas, criando uma nova linha para cada item da lista.
+    colunas_para_explodir = [col for col in df.columns if df[col].apply(lambda x: isinstance(x, list)).any()]
+    for col in colunas_para_explodir:
+        df = df.explode(col).reset_index(drop=True)
+    return df
+
+
+def fazer_backup_csv(nome_arquivo_csv, pasta_backup='backups', limite=2):
+    """
+    Cria um backup de um arquivo CSV existente e gerencia o número de backups.
+    Os backups são nomeados com um timestamp para facilitar a identificação.
+    Backups mais antigos são removidos para manter o número dentro do limite.
+
+    Args:
+        nome_arquivo_csv (str): O caminho para o arquivo CSV original a ser feito backup.
+        pasta_backup (str, optional): O nome da pasta onde os backups serão armazenados.
+                                      Padrão para 'backups'.
+        limite (int, optional): O número máximo de backups a serem mantidos.
+                                Backups mais antigos que este limite serão excluídos.
+                                Padrão para 2.
+    """
+    os.makedirs(pasta_backup, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    nome_backup = os.path.join(pasta_backup, f"{os.path.splitext(nome_arquivo_csv)[0]}_{timestamp}.csv")
+
+    try:
+        shutil.copy2(nome_arquivo_csv, nome_backup)
+        logger.info(f"Backup criado: {nome_backup}")
+    except FileNotFoundError:
+        logger.warning(f"Não foi possível criar backup. Arquivo '{nome_arquivo_csv}' não encontrado.")
+        return
+    except Exception as e:
+        logger.error(f"Erro ao criar backup de '{nome_arquivo_csv}': {e}")
+        return
+
+    # Gerencia backups, removendo os mais antigos que excedem o limite
+    backups = sorted(glob.glob(os.path.join(pasta_backup, "*.csv")))
+    if len(backups) > limite:
+        for arq in backups[:-limite]:
+            try:
+                os.remove(arq)
+                logger.info(f"Backup antigo removido: {arq}")
+            except OSError as e:
+                logger.error(f"Erro ao remover backup antigo '{arq}': {e}")
+
+
+def perguntar_sim_nao(mensagem):
+    """
+    Faz uma pergunta de sim/não ao usuário e retorna True para 'sim' ou False para 'não'.
+    Repete a pergunta até que uma resposta válida ('s' ou 'n') seja fornecida.
+
+    Args:
+        mensagem (str): A pergunta a ser exibida para o usuário.
+
+    Returns:
+        bool: True se o usuário responder 's', False se responder 'n'.
+    """
+    while True:
+        resposta = input(mensagem + " (s/n): ").strip().lower()
+        if resposta in ['s', 'n']:
+            return resposta == 's'
+        logger.warning("Resposta inválida do usuário. Esperado 's' ou 'n'.")
+        print("Resposta inválida. Digite 's' para sim ou 'n' para não.")
+
+
+def formatar_valor_moeda(valor):
+    """
+    Formata um valor numérico como uma string de moeda no formato "R$ X.XXX,XX".
+    Substitui o separador decimal por vírgula e o separador de milhar por ponto.
+
+    Args:
+        valor (float): O valor numérico a ser formatado.
+
+    Returns:
+        str: O valor formatado como string de moeda.
+    """
+    if pd.isna(valor): # Lida com valores NaN que podem surgir
+        return "N/A"
+    # Formata para 2 casas decimais, usa vírgula como separador decimal e ponto como milhar
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def tratar_dados_especificos(df):
+    """
+    Trata colunas específicas de um DataFrame, convertendo tipos de dados
+    e padronizando formatos.
+    - Colunas com 'data', 'date' ou 'dt' no nome são convertidas para datetime.
+    - Colunas de objeto com indicadores de moeda (R$) são convertidas para float.
+    - Outras colunas de objeto têm espaços em branco removidos e são capitalizadas.
+
+    Args:
+        df (pd.DataFrame): O DataFrame original a ser tratado.
+
+    Returns:
+        pd.DataFrame: Um novo DataFrame com os dados tratados.
+    """
+    df_tratado = df.copy()
+    for col in df_tratado.columns:
+        dados = df_tratado[col]
+        # Converte colunas de data
+        if re.search(r'data|date|dt', col, re.IGNORECASE):
+            df_tratado[col] = pd.to_datetime(dados, errors='coerce', dayfirst=True)
+        # Converte colunas de valores monetários
+        elif dados.dtype == 'object' and dados.str.contains(r'[R$\$]', na=False).any():
+            df_tratado[col] = (
+                dados.str.replace(r'[R$\s]', '', regex=True) # Remove 'R$' e espaços
+                .str.replace('.', '', regex=False)           # Remove separador de milhar
+                .str.replace(',', '.', regex=False)          # Troca vírgula por ponto decimal
+                .astype(float, errors='ignore')              # Converte para float
+            )
+        # Padroniza strings
+        elif dados.dtype == 'object':
+            df_tratado[col] = dados.str.strip().str.title() # Remove espaços e capitaliza
+    return df_tratado
+
+def otimizar_tipos(df):
+    """
+    Otimiza os tipos de dados de um DataFrame para reduzir o uso de memória.
+    - Converte floats para float32.
+    - Converte inteiros para o menor tipo possível (int8, int16, int32).
+    - Converte strings repetitivas para 'category'.
+
+    Args:
+        df (pd.DataFrame): O DataFrame a ser otimizado.
+
+    Returns:
+        pd.DataFrame: O DataFrame com tipos de dados otimizados.
+    """
+    logger.info("Iniciando otimização de tipos de dados.")
+    df_otimizado = df.copy() # Trabalha em uma cópia para evitar SettingWithCopyWarning
+
+    # Otimiza colunas float para float32
+    for col in df_otimizado.select_dtypes(include=['float64']).columns:
+        df_otimizado[col] = df_otimizado[col].astype(np.float32)
+        logger.debug(f"Coluna '{col}' convertida para float32.")
+
+    # Otimiza colunas int para o menor tipo possível
+    for col in df_otimizado.select_dtypes(include=['int64']).columns:
+        min_val = df_otimizado[col].min()
+        max_val = df_otimizado[col].max()
+
+        if min_val >= np.iinfo(np.int8).min and max_val <= np.iinfo(np.int8).max:
+            df_otimizado[col] = df_otimizado[col].astype(np.int8)
+            logger.debug(f"Coluna '{col}' convertida para int8.")
+        elif min_val >= np.iinfo(np.int16).min and max_val <= np.iinfo(np.int16).max:
+            df_otimizado[col] = df_otimizado[col].astype(np.int16)
+            logger.debug(f"Coluna '{col}' convertida para int16.")
+        elif min_val >= np.iinfo(np.int32).min and max_val <= np.iinfo(np.int32).max:
+            df_otimizado[col] = df_otimizado[col].astype(np.int32)
+            logger.debug(f"Coluna '{col}' convertida para int32.")
+        # Se os valores excederem int32, mantém como int64
+        else:
+            logger.debug(f"Coluna '{col}' mantida como int64 (valores fora do alcance de int32).")
+
+    # Otimiza colunas object (strings) para category
+    for col in df_otimizado.select_dtypes(include='object').columns:
+        num_unicos = df_otimizado[col].nunique()
+        total_linhas = len(df_otimizado[col])
+        # Considera converter para category se o número de valores únicos for menor que 50% do total de linhas
+        if num_unicos / total_linhas < 0.5:
+            df_otimizado[col] = df_otimizado[col].astype('category')
+            logger.debug(f"Coluna '{col}' convertida para category (unique: {num_unicos}/{total_linhas}).")
+        else:
+            logger.debug(f"Coluna '{col}' mantida como object (muitos valores únicos para category).")
+            
+    logger.info("Otimização de tipos de dados concluída.")
+    return df_otimizado
+
+
+def relatorio_validacao(df_original, df_validado):
+    """
+    Gera um relatório de validação de dados, comparando o DataFrame original
+    com o DataFrame após o tratamento, focando na contagem de valores NaN.
+
+    Args:
+        df_original (pd.DataFrame): O DataFrame antes do tratamento.
+        df_validado (pd.DataFrame): O DataFrame após o tratamento.
+    """
+    total_celulas = df_original.size
+    nans_orig = df_original.isna().sum().sum()
+    nans_valid = df_validado.isna().sum().sum()
+
+    # Descartados refere-se a novos NaNs introduzidos pelo tratamento (ex: parse de data falho)
+    descartados = max(nans_valid - nans_orig, 0)
+
+    validados = total_celulas - nans_valid
+
+    logger.info("--- Relatório de Validação ---")
+    logger.info(f"Linhas: {df_validado.shape[0]}, Colunas: {df_validado.shape[1]}")
+    logger.info(f"NaNs no original: {nans_orig}, NaNs após tratamento: {nans_valid}")
+    # Calcula a porcentagem de células que não são NaN após o tratamento
+    logger.info(f"Porcentagem de dados válidos: {validados / total_celulas * 100:.2f}%")
+    logger.info("-----------------------------")
+
+
+def baixar_e_salvar_csv_com_relatorio(url, nome_arquivo_csv='df_vendas_clientes.csv', manter_n_backups=2):
+    """
+    Baixa dados JSON de uma URL, extrai e trata-os para um DataFrame,
+    e salva o DataFrame como um arquivo CSV.
+    Permite a atualização de um arquivo CSV existente com backup e gera um relatório de validação.
+
+    Args:
+        url (str): A URL da qual baixar os dados JSON.
+        nome_arquivo_csv (str, optional): O nome do arquivo CSV para salvar os dados.
+                                         Padrão para 'df_vendas_clientes.csv'.
+        manter_n_backups (int, optional): O número de backups a serem mantidos. Padrão para 2.
+    """
+    try:
+        logger.info("Iniciando download dos dados...")
+        resposta = requests.get(url)
+        resposta.raise_for_status()  # Levanta um erro para códigos de status HTTP ruins (4xx ou 5xx)
+        logger.info("Dados baixados com sucesso.")
+        dados_json = resposta.json()
+
+        df_vendas_clientes = extrair_dataframe(dados_json)
+        df_tratado = tratar_dados_especificos(df_vendas_clientes)
+        # Aplica a otimização de tipos de dados
+        df_tratado = otimizar_tipos(df_tratado)
+
+        if os.path.exists(nome_arquivo_csv):
+            logger.info(f"O arquivo '{nome_arquivo_csv}' já existe.")
+            atualizar = perguntar_sim_nao("Deseja atualizar o arquivo CSV existente?")
+            if atualizar:
+                fazer_backup_csv(nome_arquivo_csv, limite=manter_n_backups)
+                df_tratado.to_csv(nome_arquivo_csv, index=False)
+                logger.info(f"Arquivo '{nome_arquivo_csv}' atualizado com sucesso.")
+            else:
+                logger.info("Atualização do arquivo CSV cancelada pelo usuário.")
+        else:
+            df_tratado.to_csv(nome_arquivo_csv, index=False)
+            logger.info(f"Arquivo '{nome_arquivo_csv}' criado com sucesso.")
+
+        relatorio_validacao(df_vendas_clientes, df_tratado)
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erro de conexão ou requisição HTTP: {e}")
+    except ValueError as e: # Captura erros de normalização JSON
+        logger.error(f"Erro de formato de dados JSON: {e}")
+    except Exception as e:
+        logger.error(f"Erro inesperado ao baixar ou processar os dados: {e}")
+
+
+def carregar_dados_csv(nome_arquivo='df_vendas_clientes.csv'):
+    """
+    Carrega dados de um arquivo CSV para um DataFrame pandas.
+    Realiza tratamentos adicionais nas colunas 'Data de Venda' e 'Valor da compra'
+    para garantir os tipos de dados corretos e formatar valores monetários.
+    Aplica otimização de tipos após o carregamento.
+
+    Args:
+        nome_arquivo (str, optional): O nome do arquivo CSV a ser carregado.
+                                      Padrão para 'df_vendas_clientes.csv'.
+
+    Returns:
+        pd.DataFrame: O DataFrame carregado e pré-processado.
+
+    Raises:
+        FileNotFoundError: Se o arquivo CSV não for encontrado.
+        Exception: Para outros erros durante o carregamento ou processamento.
+    """
+    logger.info(f"Carregando dados do arquivo: {nome_arquivo}")
+    df = pd.read_csv(nome_arquivo)
+
+    # Identifica e renomeia a coluna de data de venda
+    col_data = [col for col in df.columns if 'data' in col.lower() and 'venda' in col.lower()]
+    if col_data:
+        df[col_data[0]] = pd.to_datetime(df[col_data[0]], errors='coerce', dayfirst=True)
+        df.rename(columns={col_data[0]: 'Data de Venda'}, inplace=True)
+    else:
+        logger.warning("Coluna de data de venda não encontrada ou não identificada. Verifique os nomes das colunas.")
+
+    # Garante que 'Valor da compra' seja numérico
+    if 'Valor da compra' in df.columns:
+        df['Valor da compra'] = (
+            df['Valor da compra']
+            .astype(str) # Garante que seja string para aplicar .str.replace
+            .str.replace(r'[R$\s]', '', regex=True) # Remove 'R$' e espaços
+            .str.replace('.', '', regex=False)     # Remove separador de milhar
+            .str.replace(',', '.', regex=False)    # Troca vírgula por ponto decimal
+            .astype(float)                         # Converte para float
+        )
+    else:
+        logger.warning("Coluna 'Valor da compra' não encontrada. Verifique os nomes das colunas.")
+
+    # Aplica a otimização de tipos de dados após o carregamento e tratamento inicial
+    df = otimizar_tipos(df)
+
+    return df
+
+
+# --- Funções de Análise e Visualização ---
+
+def visao_geral(df):
+    """
+    Exibe uma visão geral dos dados, mostrando as vendas mais recentes
+    e formatando o 'Valor da compra' como moeda.
+
+    Args:
+        df (pd.DataFrame): O DataFrame de dados de vendas.
+    """
+    print("\n=== VISÃO GERAL DAS ÚLTIMAS VENDAS ===")
+    if 'Data de Venda' not in df.columns or 'Valor da compra' not in df.columns:
+        logger.error("Colunas 'Data de Venda' ou 'Valor da compra' ausentes no DataFrame. Não é possível gerar visão geral.")
+        print("Erro: Colunas essenciais para a visão geral não encontradas.")
+        return
+
+    # Ordena os dados pela data de venda mais recente
+    df_sorted = df.sort_values('Data de Venda', ascending=False).copy()
+
+    # Aplica a formatação de moeda
+    df_sorted['Valor da compra'] = df_sorted['Valor da compra'].apply(formatar_valor_moeda)
+
+    print(df_sorted.to_string(index=False))
+
+
+def consulta_estatistica(df):
+    """
+    Gera e exibe estatísticas agregadas por cliente, incluindo:
+    - Quantidade de compras
+    - Gasto total
+    - Porcentagem de compras em relação ao total
+
+    Args:
+        df (pd.DataFrame): O DataFrame de dados de vendas.
+    """
+    print("\n=== CONSULTA ESTATÍSTICA POR CLIENTE ===")
+    if 'Cliente' not in df.columns or 'Valor da compra' not in df.columns:
+        logger.error("Colunas 'Cliente' ou 'Valor da compra' ausentes no DataFrame. Não é possível gerar consulta estatística.")
+        print("Erro: Colunas essenciais para a consulta estatística não encontradas.")
+        return
+
+    # Agrupa por cliente e calcula as estatísticas
+    estatisticas = (
+        df.groupby('Cliente', as_index=False)
+        .agg(Qtd_Compras=('Valor da compra', 'count'),
+             Gasto_Total=('Valor da compra', 'sum'))
+    )
+
+    total_compras = estatisticas['Qtd_Compras'].sum()
+    if total_compras > 0:
+        estatisticas['Porcentagem'] = estatisticas['Qtd_Compras'] / total_compras * 100
+    else:
+        estatisticas['Porcentagem'] = 0.0
+        logger.warning("Nenhuma compra registrada para calcular porcentagens.")
+
+    # Aplica formatação de moeda e porcentagem
+    estatisticas['Gasto_Total'] = estatisticas['Gasto_Total'].apply(formatar_valor_moeda)
+    estatisticas['Porcentagem'] = estatisticas['Porcentagem'].apply(lambda x: f"{x:.2f}%")
+
+    # Ordena as estatísticas pela quantidade de compras
+    estatisticas = estatisticas.sort_values('Qtd_Compras', ascending=False)
+
+    print(estatisticas.to_string(index=False))
+
+
+def graficos(df):
+    """
+    Gera um gráfico de linha do valor das compras ao longo do tempo para clientes selecionados.
+    Permite ao usuário selecionar clientes específicos ou exibir todos.
+    Inclui a média geral das compras no gráfico.
+
+    Args:
+        df (pd.DataFrame): O DataFrame de dados de vendas.
+    """
+    print("\n=== GRÁFICOS: VALOR DAS COMPRAS POR CLIENTE AO LONGO DO TEMPO ===")
+    if 'Cliente' not in df.columns or 'Data de Venda' not in df.columns or 'Valor da compra' not in df.columns:
+        logger.error("Colunas 'Cliente', 'Data de Venda' ou 'Valor da compra' ausentes no DataFrame. Não é possível gerar gráficos.")
+        print("Erro: Colunas essenciais para o gráfico não encontradas.")
+        return
+
+    clientes_unicos = df['Cliente'].dropna().unique() # Remove NaNs de clientes para exibição
+    if len(clientes_unicos) == 0:
+        print("Nenhum cliente disponível para exibição de gráficos.")
+        logger.info("Nenhum cliente único encontrado para gerar gráficos.")
+        return
+
+    print("Clientes disponíveis:")
+    for i, c in enumerate(clientes_unicos):
+        print(f"{i}: {c}")
+
+    escolha = input("\nDigite os índices dos clientes (separados por vírgula) para plotar, ou pressione ENTER para ver todos: ").strip()
+
+    clientes_selecionados = []
+    if escolha == '':
+        # Garante que clientes_selecionados seja sempre uma lista Python
+        clientes_selecionados = list(clientes_unicos)
+    else:
+        try:
+            # Filtra apenas índices numéricos válidos e dentro do limite
+            indices = [int(i.strip()) for i in escolha.split(',') if i.strip().isdigit()]
+            clientes_selecionados = [clientes_unicos[i] for i in indices if 0 <= i < len(clientes_unicos)]
+            if not clientes_selecionados:
+                logger.warning("Nenhum índice de cliente válido fornecido. Exibindo todos os clientes.")
+                print("Nenhum cliente válido selecionado com os índices fornecidos. Exibindo todos os clientes.")
+                clientes_selecionados = list(clientes_unicos)
+        except ValueError: # Captura erro se a conversão para int falhar (ex: "a,b,c")
+            logger.warning("Entrada de índice de cliente inválida. Exibindo todos os clientes.")
+            print("Entrada inválida. Por favor, use números inteiros separados por vírgula. Exibindo todos os clientes.")
+            clientes_selecionados = list(clientes_unicos)
+        except IndexError: # Captura erro se o índice estiver fora dos limites (ex: 999)
+            logger.warning("Índice de cliente fora do alcance. Exibindo todos os clientes.")
+            print("Um ou mais índices estão fora do alcance. Exibindo todos os clientes.")
+            clientes_selecionados = list(clientes_unicos)
+
+
+    if not clientes_selecionados: # Verifica novamente se a lista de clientes selecionados não está vazia
+        logger.info("Nenhum cliente selecionado para plotar após tentativa de escolha.")
+        print("Nenhum cliente válido para plotar.")
+        return
+
+    sns.set(style="whitegrid")
+    plt.figure(figsize=(14, 7))
+
+    # Filtra o DataFrame pelos clientes selecionados e agrupa por data e cliente
+    df_filtrado = df[df['Cliente'].isin(clientes_selecionados)].copy()
+    if df_filtrado.empty:
+        logger.info("DataFrame filtrado está vazio para os clientes selecionados. Nada para plotar.")
+        print("Não há dados de compras para os clientes selecionados no período disponível.")
+        plt.close() # Fecha a figura vazia
+        return
+
+    # Garante que a coluna de data esteja no formato correto para o agrupamento
+    df_filtrado['Data de Venda'] = pd.to_datetime(df_filtrado['Data de Venda'], errors='coerce')
+    df_pivot = df_filtrado.groupby(['Data de Venda', 'Cliente'])['Valor da compra'].sum().unstack(fill_value=0)
+    df_pivot = df_pivot.sort_index()
+
+    media_geral = df['Valor da compra'].mean()
+    palette = sns.color_palette("tab10", n_colors=len(clientes_selecionados))
+
+    for idx, cliente in enumerate(clientes_selecionados):
+        if cliente in df_pivot.columns: # Verifica se o cliente tem dados no pivot
+            plt.plot(df_pivot.index, df_pivot[cliente], label=cliente, color=palette[idx])
+            # Marca o pico de vendas para cada cliente
+            if not df_pivot[cliente].empty and df_pivot[cliente].max() > 0:
+                pico_data = df_pivot[cliente].idxmax()
+                max_val = df_pivot[cliente].max()
+                plt.scatter(pico_data, max_val, color='black', zorder=5, s=100, marker='o',
+                            label=f'Pico {cliente}' if idx == 0 else "") # Adiciona label apenas uma vez
+        else:
+            logger.warning(f"Dados para o cliente '{cliente}' não encontrados no DataFrame pivotado.")
+
+    plt.axhline(media_geral, color='orange', linestyle='--', label=f'Média Geral de Compras: {formatar_valor_moeda(media_geral)}')
+    plt.title("Valor das Compras por Cliente ao Longo do Tempo", fontsize=16)
+    plt.xlabel("Data de Venda", fontsize=14)
+    plt.ylabel("Valor da Compra (R$)", fontsize=14)
+
+    # Adiciona legendas de pico de forma mais inteligente se houver muitos clientes
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), title='Clientes e Média', fontsize=10, title_fontsize=11, loc='upper left', bbox_to_anchor=(1, 1))
+
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    # Ajusta o locator para evitar sobreposição de rótulos de data
+    plt.gca().xaxis.set_major_locator(mticker.MaxNLocator(nbins=10)) # Limita o número de rótulos de data
+    plt.gcf().autofmt_xdate(rotation=45) # Rotaciona os rótulos de data para melhor leitura
+
+    # Formata o eixo Y como moeda
+    plt.gca().yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: formatar_valor_moeda(x))
+    )
+
+    plt.tight_layout(rect=[0, 0, 0.88, 1]) # Ajusta layout para acomodar a legenda fora do gráfico
+    plt.show()
+
+
+# --- Função Principal ---
+
+def main():
+    """
+    Função principal que orquestra o fluxo do programa.
+    Baixa os dados, processa-os e apresenta um menu interativo
+    para o usuário realizar análises e visualizar gráficos.
+    """
+    url = 'https://cdn3.gnarususercontent.com.br/2928-transformacao-manipulacao-dados/dados_vendas_clientes.json'
+    nome_csv = 'df_vendas_clientes.csv'
+
+    baixar_e_salvar_csv_com_relatorio(url, nome_arquivo_csv=nome_csv)
+
+    try:
+        df = carregar_dados_csv(nome_csv)
+    except FileNotFoundError:
+        logger.error(f"O arquivo CSV '{nome_csv}' não foi encontrado. Por favor, execute o download primeiro.")
+        print(f"Erro: O arquivo '{nome_csv}' não foi encontrado. Certifique-se de que os dados foram baixados e salvos corretamente.")
+        return
+    except Exception as e:
+        logger.error(f"Erro inesperado ao carregar o CSV '{nome_csv}': {e}")
+        print(f"Ocorreu um erro ao carregar os dados: {e}")
+        return
+
+    while True:
+        print("\n" + "="*20 + " MENU PRINCIPAL " + "="*20)
+        print("1 - Visão Geral das Últimas Compras")
+        print("2 - Consulta Estatística por Cliente")
+        print("3 - Gráficos de Vendas por Cliente")
+        print("0 - Sair do Programa")
+        print("="*58)
+
+        opcao = input("Escolha uma opção: ").strip()
+
+        if opcao == '1':
+            visao_geral(df)
+        elif opcao == '2':
+            consulta_estatistica(df)
+        elif opcao == '3':
+            graficos(df)
+        elif opcao == '0':
+            logger.info("Encerrando o programa conforme solicitação do usuário.")
+            print("Saindo do programa. Até mais!")
+            break
+        else:
+            print("Opção inválida. Por favor, escolha uma opção entre 0 e 3.")
+            logger.warning(f"Opção de menu inválida inserida: '{opcao}'.")
+
+
+if __name__ == "__main__":
+    main()
